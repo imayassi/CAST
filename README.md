@@ -2,8 +2,6 @@
 
 This repository contains the **Capacity Analytics & Simulation Toolkit (CAST)**, a Python-based framework for analyzing team capacity, workload stress, and optimizing headcount distribution. Using operational data, it calculates key performance indicators, simulates "what-if" scenarios, and provides data-driven recommendations for improving team efficiency and balance. The final output is a comprehensive, self-contained HTML executive summary generated with the help of an LLM.
 
-![Sample Quadrant Plot](quadrant_all_groups.png)
-
 ---
 
 ## Key Features
