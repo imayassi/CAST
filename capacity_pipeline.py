@@ -451,68 +451,182 @@ def plot_color_grid(grid_df, color_by="WSI_0_100", title="StaffGroup Grid"):
     fig.update_layout(title=title, margin=dict(l=140, t=80))
     return fig
 
-# def pre_post_tree_pipeline(df_in, scores_baseline, month, moves, compute_wsi_fn, wsi_kwargs, targets, only_impacted=True):
-#     train_df = prepare_training_df(df_in, scores_baseline, compute_wsi_fn=compute_wsi_fn, wsi_kwargs=wsi_kwargs)
-#     models, mse = fit_tree_models(train_df, targets=targets)
-#     pre_grid = train_df[train_df["_date_"] == _mstart(month)].groupby("StaffGroup")[["Capacity"] + list(targets)].median().reset_index()
-#     post_cap = simulate_post_capacity(df_in, scores_baseline, month, moves)
-#     post_grid = predict_post_from_capacity(post_cap, models, targets=targets)
-#     if only_impacted:
-#         impacted = get_impacted_sgs(moves)
-#         pre_grid, post_grid = pre_grid[pre_grid.StaffGroup.isin(impacted)], post_grid[post_grid.StaffGroup.isin(impacted)]
-#     pre_grid["Scenario"], post_grid["Scenario"] = "Pre", "Post (pred)"
-#     combined = pd.concat([pre_grid, post_grid]).sort_values(["StaffGroup", "Scenario"])
-#     plot_df = combined.copy(); plot_df["StaffGroup"] += " — " + plot_df["Scenario"]
-#     fig = plot_color_grid(plot_df)
-#     return pre_grid, post_grid, combined, fig, mse
-
-# In capacity_pipeline.py, replace the pre_post_tree_pipeline function
-
 def pre_post_tree_pipeline(
-    df_in: pd.DataFrame, scores_baseline: pd.DataFrame, month: str, moves: List[Dict], *,
-    compute_wsi_fn, wsi_kwargs: Optional[dict] = None,
+    df_in: pd.DataFrame,
+    scores_baseline: pd.DataFrame,
+    month: str,
+    moves: List[Dict], *,
+    compute_wsi_fn,
+    wsi_kwargs: Optional[dict] = None,
     targets=("WSI_0_100", "efficiency", "days_to_close", "backlog"),
-    only_impacted=True
+    only_impacted: bool = True,
+    team_level_post: bool = False,      # NEW: predict once per team from aggregated capacity
+    show_predict_samples: bool = True   # NEW: print the exact X passed into .predict()
 ):
     """
     Runs the end-to-end simulation pipeline and returns results including a sanity check DataFrame.
+    PRE grid uses observed actuals. POST grid is simulated using the trained outcome models.
     """
-    train_df = prepare_training_df(df_in, scores_baseline, compute_wsi_fn=compute_wsi_fn, wsi_kwargs=wsi_kwargs)
+    # -----------------------------
+    # 0) Prep + fit
+    # -----------------------------
+    train_df = prepare_training_df(df_in, scores_baseline,
+                                   compute_wsi_fn=compute_wsi_fn, wsi_kwargs=wsi_kwargs)
     models, mse_report = fit_tree_models(train_df, targets=targets)
-    
+
     m0 = _mstart(month)
-    pre_month = train_df[train_df["_date_"] == m0]
-    grid_pre = pre_month.groupby("StaffGroup")[["Capacity"] + list(targets)].median().reset_index()
-    
-    # --- NEW: Calculate the sanity check ranges (IQR) ---
+    pre_month = train_df[train_df["_date_"] == m0].copy()
+
+    # -----------------------------
+    # 1) PRE grid (actuals, team median)
+    # -----------------------------
+    # Capacity + targets at team level (median by default to match prior behavior)
+    pre_cols = ["Capacity"] + list(targets)
+    pre_cols = [c for c in pre_cols if c in pre_month.columns]
+    grid_pre = (pre_month.groupby("StaffGroup")[pre_cols]
+                .median().reset_index())
+
+    # Sanity ranges (IQR) for PRE (alias-level)
     sanity_ranges = {}
     for metric in ["Capacity"] + list(targets):
         if metric in pre_month.columns:
             q1 = pre_month[metric].quantile(0.25)
             q3 = pre_month[metric].quantile(0.75)
             sanity_ranges[metric] = f"{q1:.2f} to {q3:.2f}"
-            
-    sanity_df = pd.DataFrame.from_dict(sanity_ranges, orient='index', columns=['Typical Range (25th-75th percentile)'])
-    sanity_df.index.name = "Metric"
-    
-    post_cap = simulate_post_capacity(df_in, scores_baseline, month, moves)
-    grid_post = predict_post_from_capacity(post_cap, models, targets=targets)
-    
+    sanity_df = (pd.DataFrame.from_dict(sanity_ranges, orient='index',
+                                        columns=['Typical Range (25th-75th percentile)'])
+                 .rename_axis("Metric"))
+
+    # -----------------------------
+    # 2) POST capacity simulation
+    # -----------------------------
+    post_cap = simulate_post_capacity(df_in, scores_baseline, month, moves).copy()
+    # Ensure expected schema
+    if "_date_" in post_cap.columns:
+        post_cap["_date_"] = pd.to_datetime(post_cap["_date_"]).dt.to_period("M").dt.to_timestamp()
+        post_cap = post_cap[post_cap["_date_"] == m0].copy()
+    if "Capacity" not in post_cap.columns and "Capacity_Score_0_100" in post_cap.columns:
+        post_cap = post_cap.rename(columns={"Capacity_Score_0_100": "Capacity"})
+
+    # -----------------------------
+    # 3) POST grid (two modes)
+    # -----------------------------
+    if not team_level_post:
+        # Alias-level path (original behavior)
+        # Show exactly what goes into the model: Capacity + StaffGroup (raw; OHE is inside pipeline)
+        if show_predict_samples:
+            X_alias_preview = post_cap[["Capacity", "StaffGroup"]].copy()
+            X_alias_preview["StaffGroup"] = X_alias_preview["StaffGroup"].astype("string").fillna("__MISSING__")
+            print("\n[DEBUG] Alias-level predict() sample (first 8 rows):")
+            print(X_alias_preview.head(8).to_string(index=False))
+            print("Rows to predict (alias-level):", len(X_alias_preview))
+
+        grid_post = predict_post_from_capacity(post_cap, models, targets=targets)
+        # Optional: bring team capacity to grid_post (median) so combined tables still show Capacity
+        team_cap_post = (post_cap.groupby("StaffGroup", as_index=False)["Capacity"].median())
+        if "Capacity" not in grid_post.columns:
+            grid_post = grid_post.merge(team_cap_post, on="StaffGroup", how="left")
+
+    else:
+        # Team-level path (predict once per team from aggregated capacity)
+        team_cap = (post_cap.groupby("StaffGroup", as_index=False)["Capacity"].median())
+        # Build raw X exactly like training (let pipeline do OneHotEncoder internally)
+        X_team = team_cap[["Capacity", "StaffGroup"]].copy()
+        X_team["StaffGroup"] = X_team["StaffGroup"].astype("string").fillna("__MISSING__")
+
+        if show_predict_samples:
+            print("\n[DEBUG] Team-level predict() sample (first 20 rows):")
+            print(X_team.head(20).to_string(index=False))
+            print("Rows to predict (team-level):", len(X_team))
+
+        preds = {"StaffGroup": team_cap["StaffGroup"].values}
+        for t in targets:
+            preds[t] = models[t].predict(X_team)
+        grid_post = pd.DataFrame(preds)
+        # Add capacity column for completeness in combined view
+        grid_post = grid_post.merge(team_cap, on="StaffGroup", how="left")
+
+    # -----------------------------
+    # 4) Restrict to impacted teams (safely)
+    # -----------------------------
     if only_impacted:
         impacted = get_impacted_sgs(moves)
-        grid_pre = grid_pre[grid_pre["StaffGroup"].isin(impacted)]
-        grid_post = grid_post[grid_post["StaffGroup"].isin(impacted)]
-        
+        # Safety: only filter if we actually have overlap; otherwise leave as-is and warn
+        pre_mask = grid_pre["StaffGroup"].isin(impacted)
+        post_mask = grid_post["StaffGroup"].isin(impacted)
+        if pre_mask.any():
+            grid_pre = grid_pre[pre_mask]
+        else:
+            print("[WARN] No PRE rows match impacted teams; leaving PRE unfiltered.")
+        if post_mask.any():
+            grid_post = grid_post[post_mask]
+        else:
+            print("[WARN] No POST rows match impacted teams; leaving POST unfiltered.")
+
+    # -----------------------------
+    # 5) Combine in the original table-like format + plot
+    # -----------------------------
     gp = grid_pre.copy(); gp["Scenario"] = "Pre"
     gq = grid_post.copy(); gq["Scenario"] = "Post (pred)"
-    combined = pd.concat([gp, gq], ignore_index=True).sort_values(["StaffGroup", "Scenario"]).reset_index(drop=True)
-    
-    grid_for_plot = combined.copy()
-    grid_for_plot["StaffGroup"] = grid_for_plot["StaffGroup"] + " — " + grid_for_plot["Scenario"].astype(str)
-    fig = plot_color_grid(grid_for_plot, title="Pre vs. Post Simulation")
-    
-    # --- UPDATED: Return the new sanity_df as well ---
+    combined = (pd.concat([gp, gq], ignore_index=True)
+                  .sort_values(["StaffGroup", "Scenario"])
+                  .reset_index(drop=True))
+
+    fig = plot_color_grid_with_sanity(
+        combined,                  # uses StaffGroup + Scenario shape directly
+        sanity_df,                 # IQR ranges
+        title="Pre vs. Post Simulation (Sanity-flagged)",
+        metrics=[m for m in ["Capacity","WSI_0_100","efficiency","days_to_close","backlog","numCases"] if m in combined.columns],
+        soft_color="rgba(255, 99, 71, 0.18)"  # adjust softness as you like
+    )
+
     return grid_pre, grid_post, combined, fig, mse_report, sanity_df
+
+# def pre_post_tree_pipeline(
+#     df_in: pd.DataFrame, scores_baseline: pd.DataFrame, month: str, moves: List[Dict], *,
+#     compute_wsi_fn, wsi_kwargs: Optional[dict] = None,
+#     targets=("WSI_0_100", "efficiency", "days_to_close", "backlog"),
+#     only_impacted=True
+# ):
+#     """
+#     Runs the end-to-end simulation pipeline and returns results including a sanity check DataFrame.
+#     """
+#     train_df = prepare_training_df(df_in, scores_baseline, compute_wsi_fn=compute_wsi_fn, wsi_kwargs=wsi_kwargs)
+#     models, mse_report = fit_tree_models(train_df, targets=targets)
+    
+#     m0 = _mstart(month)
+#     pre_month = train_df[train_df["_date_"] == m0]
+#     grid_pre = pre_month.groupby("StaffGroup")[["Capacity"] + list(targets)].median().reset_index()
+    
+#     # --- NEW: Calculate the sanity check ranges (IQR) ---
+#     sanity_ranges = {}
+#     for metric in ["Capacity"] + list(targets):
+#         if metric in pre_month.columns:
+#             q1 = pre_month[metric].quantile(0.25)
+#             q3 = pre_month[metric].quantile(0.75)
+#             sanity_ranges[metric] = f"{q1:.2f} to {q3:.2f}"
+            
+#     sanity_df = pd.DataFrame.from_dict(sanity_ranges, orient='index', columns=['Typical Range (25th-75th percentile)'])
+#     sanity_df.index.name = "Metric"
+    
+#     post_cap = simulate_post_capacity(df_in, scores_baseline, month, moves)
+#     grid_post = predict_post_from_capacity(post_cap, models, targets=targets)
+    
+#     if only_impacted:
+#         impacted = get_impacted_sgs(moves)
+#         grid_pre = grid_pre[grid_pre["StaffGroup"].isin(impacted)]
+#         grid_post = grid_post[grid_post["StaffGroup"].isin(impacted)]
+        
+#     gp = grid_pre.copy(); gp["Scenario"] = "Pre"
+#     gq = grid_post.copy(); gq["Scenario"] = "Post (pred)"
+#     combined = pd.concat([gp, gq], ignore_index=True).sort_values(["StaffGroup", "Scenario"]).reset_index(drop=True)
+    
+#     grid_for_plot = combined.copy()
+#     grid_for_plot["StaffGroup"] = grid_for_plot["StaffGroup"] + " — " + grid_for_plot["Scenario"].astype(str)
+#     fig = plot_color_grid(grid_for_plot, title="Pre vs. Post Simulation")
+    
+#     # --- UPDATED: Return the new sanity_df as well ---
+#     return grid_pre, grid_post, combined, fig, mse_report, sanity_df
 
 def compute_capacity_centric_wsi(df, **kwargs):
     cols = ColumnMap(**{k:v for k,v in kwargs.items() if hasattr(ColumnMap,k)})
@@ -702,24 +816,49 @@ def plot_contributions_waterfall(contrib_df: pd.DataFrame, alias: str, save_path
     if save_path: plt.savefig(save_path, bbox_inches='tight', dpi=150); print(f"✅ Plot saved to: {save_path}")
     plt.show()
 
-def plot_simulation_heatmap(pre_df: pd.DataFrame, post_df: pd.DataFrame, group_col: str = "StaffGroup", only_impacted: bool = True, save_path: Optional[str] = None) -> pd.DataFrame:
-    plot_cols = ["Capacity_Score_0_100", "WSI_0_100", "efficiency", "days_to_close", "backlog", "numCases"]
-    common_cols = [c for c in plot_cols if c in pre_df.columns and c in post_df.columns]
-    if only_impacted:
-        impacted = get_impacted_sgs([{"from": r['from_group'], "to": r['to_group']} for _, r in pd.DataFrame(pre_df).iterrows()])
-        pre_df = pre_df[pre_df[group_col].isin(impacted)]
-        post_df = post_df[post_df[group_col].isin(impacted)]
-    
-    pre_df['Scenario'] = 'Pre'
-    post_df['Scenario'] = 'Post'
-    stacked_df = pd.concat([pre_df, post_df]).set_index([group_col, 'Scenario'])[common_cols]
-    
-    fig, ax = plt.subplots(figsize=(10, len(stacked_df) * 0.5))
-    sns.heatmap(stacked_df, annot=True, fmt=".1f", cmap="RdYlGn_r", linewidths=.5, ax=ax)
-    ax.set_title('Pre vs. Post Simulation Metrics', fontsize=16, weight='bold')
-    if save_path: plt.savefig(save_path, bbox_inches='tight', dpi=150); print(f"✅ Plot saved to: {save_path}")
-    plt.show()
-    return stacked_df
+# in capacity_pipeline.py
+def plot_simulation_heatmap(
+    combined: pd.DataFrame,
+    metric_for_color: str = "WSI_0_100_Optimized",
+    zmin: float | None = None,
+    zmax: float | None = None,
+):
+    """
+    Heatmap where color is driven by `metric_for_color`.
+    Defaults to optimized WSI so higher stress -> red, lower -> green.
+    Pass "WSI_0_100_Initial" if you want the pre state, or "WSI_0_100_Delta" if you compute deltas.
+    """
+    import plotly.express as px
+
+    # Ensure the column exists; fall back gracefully
+    m = metric_for_color
+    if m not in combined.columns:
+        # try common fallbacks in order
+        for cand in ["WSI_0_100_Optimized", "WSI_0_100_Initial", "WSI_0_100"]:
+            if cand in combined.columns:
+                m = cand
+                break
+
+    z = (combined
+         .pivot(index="StaffGroup", columns="_metric", values=m)
+         .sort_index())
+
+    fig = px.imshow(
+        z.values,
+        x=z.columns,
+        y=z.index,
+        color_continuous_scale="RdYlGn_r",  # high WSI -> red, low -> green
+        zmin=zmin,
+        zmax=zmax,
+        aspect="auto"
+    )
+    fig.update_layout(
+        title=f"Grid Heatmap (color: {m})",
+        xaxis_title="Metric",
+        yaxis_title="StaffGroup",
+        coloraxis_colorbar_title=m
+    )
+    return fig
     
 def plot_optimization_plan(plan: List[Dict], save_path: Optional[str] = None):
     if not plan: return
@@ -785,3 +924,400 @@ def plot_bucket_uplift_distributions(alias_df: pd.DataFrame, metric: str, from_b
     plt.legend(); plt.grid(True, which='both', linestyle='--', linewidth=0.5)
     if save_path: plt.savefig(save_path, bbox_inches='tight', dpi=150); print(f"✅ Bucket uplift plot saved to: {save_path}")
     plt.show()
+
+import re
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
+def _extract_q1_q3_from_sanity(sanity_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Accepts either:
+      - a sanity_df like you currently build:
+        index: Metric, column: 'Typical Range (25th-75th percentile)' with 'Q1 to Q3' string
+      - OR a richer frame with numeric 'q1' and 'q3' columns.
+
+    Returns a DataFrame with index=metric and numeric columns ['q1','q3'].
+    """
+    sd = sanity_df.copy()
+    if {"q1", "q3"}.issubset(sd.columns):
+        out = sd[["q1", "q3"]].copy()
+        out.index = out.index.astype(str)
+        return out
+
+    # Parse "a.b to c.d"
+    pat = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)\s*$")
+    rows = []
+    for metric, row in sd.iterrows():
+        s = str(row.get("Typical Range (25th-75th percentile)", "")).strip()
+        m = pat.match(s)
+        if m:
+            q1, q3 = float(m.group(1)), float(m.group(2))
+        else:
+            q1 = q3 = np.nan
+        rows.append((str(metric), q1, q3))
+    out = pd.DataFrame(rows, columns=["metric", "q1", "q3"]).set_index("metric")
+    return out
+
+def plot_color_grid_with_sanity(
+    combined_table: pd.DataFrame,
+    sanity_df: pd.DataFrame,
+    *,
+    title: str = "Pre vs. Post Simulation (Sanity-flagged)",
+    metrics: list[str] = None,
+    soft_color: str = "rgba(255, 99, 71, 0.18)",   # soft tomato red
+    base_alt_color: str = "rgba(0,0,0,0)",         # transparent
+) -> go.Figure:
+    """
+    Render the same table-like grid (StaffGroup — Scenario rows)
+    and softly highlight any metric cell that falls outside its sanity IQR [q1, q3].
+
+    Parameters
+    ----------
+    combined_table : DataFrame
+        Output of your pre_post_tree_pipeline 'combined' (already stacked Pre/Post).
+        Must include columns: ['StaffGroup','Scenario', metric...]
+    sanity_df : DataFrame
+        Your sanity table. Either has numeric ['q1','q3'] columns indexed by metric,
+        or a single string column 'Typical Range (25th-75th percentile)' like '12.3 to 18.9'.
+    metrics : list[str]
+        Which metric columns to show/flag. Defaults to common ones found in combined_table.
+    """
+
+    df = combined_table.copy()
+    # Preserve the original label style
+    df["Row"] = df["StaffGroup"].astype(str) + " — " + df["Scenario"].astype(str)
+
+    # Decide which metrics to show
+    default_metrics = ["Capacity", "WSI_0_100", "efficiency", "days_to_close", "backlog", "numCases"]
+    if metrics is None:
+        metrics = [m for m in default_metrics if m in df.columns]
+        # if Capacity missing (e.g., depending on your grid_post), ignore silently
+
+    # Build the display frame (Row + metrics)
+    display_cols = ["Row"] + metrics
+    show_df = df[display_cols].copy()
+
+    # Extract numeric q1/q3 for each metric
+    qtbl = _extract_q1_q3_from_sanity(sanity_df)
+
+    # Prepare cell fill colors: Plotly go.Table wants column-wise color lists
+    fillcolors = []
+    # First column (Row label) uses no highlighting; use transparent for all rows
+    fillcolors.append([base_alt_color] * len(show_df))
+
+    # For each metric column, build a color vector marking out-of-IQR cells
+    for metric in metrics:
+        col_vals = pd.to_numeric(show_df[metric], errors="coerce")
+        q1 = qtbl.loc[metric, "q1"] if metric in qtbl.index else np.nan
+        q3 = qtbl.loc[metric, "q3"] if metric in qtbl.index else np.nan
+
+        if np.isnan(q1) or np.isnan(q3):
+            # If no sanity range, keep base color
+            fillcolors.append([base_alt_color] * len(col_vals))
+        else:
+            mask = (col_vals < q1) | (col_vals > q3)
+            fillcolors.append([soft_color if bool(m) else base_alt_color for m in mask])
+
+    # Build the table
+    header_values = ["StaffGroup — Scenario"] + metrics
+    cell_values = [show_df[c].tolist() for c in ["Row"] + metrics]
+
+    fig = go.Figure(
+        data=[
+            go.Table(
+                header=dict(
+                    values=header_values,
+                    fill_color="rgba(240,240,240,1)",
+                    align="left",
+                ),
+                cells=dict(
+                    values=cell_values,
+                    fill_color=fillcolors,
+                    align="left",
+                    format=[None] + [".2f"] * len(metrics),
+                ),
+            )
+        ]
+    )
+    fig.update_layout(title=title, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+# ---- NEW: generic fitter that can include numCases
+from typing import List, Dict, Tuple
+import numpy as np
+import pandas as pd
+
+def fit_tree_models_from_features(
+    train_df: pd.DataFrame,
+    targets: Tuple[str, ...] = ("WSI_0_100", "efficiency", "days_to_close", "backlog"),
+    num_features: List[str] = ("Capacity", "numCases"),
+    cat_features: List[str] = ("StaffGroup",),
+    random_state: int = 42,
+):
+    """
+    Train one sklearn pipeline per target using the specified numeric + categorical features.
+    Uses OneHotEncoder(handle_unknown="ignore") for categorical features inside the pipeline.
+
+    Returns
+    -------
+    models: Dict[str, sklearn.Pipeline]
+        One fitted pipeline per target.
+    mse_report: pd.DataFrame
+        In-sample MSE per target (for transparency).
+    """
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.pipeline import Pipeline
+    from sklearn.metrics import mean_squared_error
+
+    # Prefer XGBRegressor if available, else fall back to RandomForestRegressor
+    try:
+        from xgboost import XGBRegressor
+        Regr = lambda: XGBRegressor(
+            n_estimators=400,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.0,
+            reg_lambda=1.0,
+            random_state=random_state,
+            n_jobs=-1,
+            objective="reg:squarederror",
+        )
+    except Exception:
+        from sklearn.ensemble import RandomForestRegressor
+        Regr = lambda: RandomForestRegressor(
+            n_estimators=500, random_state=random_state, n_jobs=-1
+        )
+
+    # Build feature matrix X and ensure types
+    X = train_df[list(num_features) + list(cat_features)].copy()
+    for c in cat_features:
+        X[c] = X[c].astype("string").fillna("__MISSING__")
+
+    models: Dict[str, Pipeline] = {}
+    rows = []
+
+    # Preprocessor
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", list(num_features)),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), list(cat_features)),
+        ],
+        remainder="drop",
+        n_jobs=None,
+    )
+
+    for t in targets:
+        if t not in train_df.columns:
+            continue
+        y = pd.to_numeric(train_df[t], errors="coerce")
+        mask = y.notna().values
+        Xt = X.loc[mask]
+        yt = y.loc[mask]
+
+        pipe = Pipeline(steps=[("prep", pre), ("regr", Regr())])
+        pipe.fit(Xt, yt)
+
+        yhat = pipe.predict(Xt)
+        mse  = float(mean_squared_error(yt, yhat))
+        models[t] = pipe
+        rows.append({"target": t, "mse": mse, "n": int(mask.sum())})
+
+    mse_report = pd.DataFrame(rows).sort_values("target").reset_index(drop=True)
+    return models, mse_report
+
+
+# ---- NEW: predictor that consumes post capacity & numCases and aggregates to team
+def predict_post_from_cap_and_cases(
+    post_df: pd.DataFrame,
+    models: Dict[str, "Pipeline"],
+    targets: Tuple[str, ...] = ("WSI_0_100", "efficiency", "days_to_close", "backlog"),
+    team_aggregate: str = "median",
+    *,
+    debug_sample: bool = True,
+):
+    """
+    Predict POST outcomes from post_df using models trained with features
+    ["Capacity", "numCases", "StaffGroup"]. Aggregates predictions to team level.
+
+    Parameters
+    ----------
+    post_df : DataFrame
+        Must have columns: ["StaffGroup","Capacity","numCases"] at alias-level or team-level.
+        If alias-level, predictions are made per alias and then aggregated.
+        If team-level (one row per StaffGroup), predictions are made once per team.
+    """
+    agg = team_aggregate
+    need_cols = ["Capacity", "numCases", "StaffGroup"]
+    for c in need_cols:
+        if c not in post_df.columns:
+            raise ValueError(f"predict_post_from_cap_and_cases: missing required column '{c}' in post_df")
+
+    X = post_df[need_cols].copy()
+    X["StaffGroup"] = X["StaffGroup"].astype("string").fillna("__MISSING__")
+
+    if debug_sample:
+        print("\n[DEBUG] Predict() input sample (Capacity + numCases + StaffGroup):")
+        print(X.head(12).to_string(index=False))
+        print("Rows to predict:", len(X))
+
+    preds = {}
+    for t, mdl in models.items():
+        if t not in targets:
+            continue
+        preds[t] = mdl.predict(X)
+
+    pred_df = pd.DataFrame({"StaffGroup": X["StaffGroup"], **preds})
+
+    # If alias-level, aggregate to team
+    grid_post = (
+        pred_df.groupby("StaffGroup", as_index=False)
+        .agg({k: agg for k in preds.keys()})
+    )
+
+    # Carry Capacity & numCases at team level for display
+    add_cols = {}
+    for c in ["Capacity", "numCases"]:
+        if c in post_df.columns:
+            add_cols[c] = agg
+    if add_cols:
+        team_extras = post_df.groupby("StaffGroup", as_index=False).agg(add_cols)
+        grid_post = grid_post.merge(team_extras, on="StaffGroup", how="left")
+
+    return grid_post
+
+
+# ---- NEW: a parallel pipeline that uses Capacity + numCases + StaffGroup
+from typing import Optional, List, Dict, Tuple
+
+def pre_post_tree_pipeline_cap_cases(
+    df_in: pd.DataFrame, scores_baseline: pd.DataFrame, month: str, moves: List[Dict], *,
+    compute_wsi_fn, wsi_kwargs: Optional[dict] = None,
+    targets: Tuple[str, ...] = ("WSI_0_100", "efficiency", "days_to_close", "backlog"),
+    only_impacted: bool = True,
+    team_level_post: bool = False,       # keep both modes
+    show_predict_samples: bool = True,
+):
+    """
+    Same outputs as your original function, but the outcome models are trained with
+    features: Capacity + numCases + StaffGroup, and predictions consume numCases_post.
+    """
+    # 0) Prepare training data (same helper you already use)
+    train_df = prepare_training_df(df_in, scores_baseline,
+                                   compute_wsi_fn=compute_wsi_fn, wsi_kwargs=wsi_kwargs)
+
+    # Safety: ensure required columns exist
+    need_train = {"StaffGroup", "_date_", "Capacity", "numCases", *targets}
+    missing = [c for c in need_train if c not in train_df.columns]
+    if missing:
+        raise ValueError(f"pre_post_tree_pipeline_cap_cases: training data missing columns: {missing}")
+
+    # Fit models using Capacity + numCases + StaffGroup
+    models, mse_report = fit_tree_models_from_features(
+        train_df=train_df,
+        targets=targets,
+        num_features=["Capacity", "numCases"],
+        cat_features=["StaffGroup"],
+    )
+
+    # PRE month & grid (actuals, team median)
+    m0 = _mstart(month)
+    pre_month = train_df[train_df["_date_"] == m0].copy()
+    grid_pre = (pre_month.groupby("StaffGroup")[["Capacity", "numCases", *targets]]
+                .median().reset_index())
+
+    # Sanity IQR based on alias-level PRE
+    sanity_ranges = {}
+    for metric in ["Capacity", "numCases", *targets]:
+        if metric in pre_month.columns:
+            q1 = pre_month[metric].quantile(0.25)
+            q3 = pre_month[metric].quantile(0.75)
+            sanity_ranges[metric] = f"{q1:.2f} to {q3:.2f}"
+    sanity_df = (pd.DataFrame.from_dict(sanity_ranges, orient='index',
+                                        columns=['Typical Range (25th-75th percentile)'])
+                 .rename_axis("Metric"))
+
+    # POST capacity simulation
+    post_cap = simulate_post_capacity(df_in, scores_baseline, month, moves).copy()
+
+    # Normalize month and column names
+    if "_date_" in post_cap.columns:
+        post_cap["_date_"] = pd.to_datetime(post_cap["_date_"]).dt.to_period("M").dt.to_timestamp()
+        post_cap = post_cap[post_cap["_date_"] == m0].copy()
+    if "Capacity" not in post_cap.columns and "Capacity_Score_0_100" in post_cap.columns:
+        post_cap = post_cap.rename(columns={"Capacity_Score_0_100": "Capacity"})
+
+    # Ensure numCases_post exists; if not present, try a reasonable fallback
+    if "numCases" not in post_cap.columns:
+        # Fallback: use PRE team median numCases
+        team_cases_pre = pre_month.groupby("StaffGroup", as_index=False)["numCases"].median()
+        post_cap = post_cap.merge(team_cases_pre, on="StaffGroup", how="left")
+        print("[WARN] simulate_post_capacity did not provide 'numCases'; using PRE team medians as a fallback.")
+
+    # POST prediction:
+    # - alias-level (default): predict per alias then aggregate
+    # - team-level: aggregate (Capacity,numCases) to team, predict once per team
+    if not team_level_post:
+        # Alias-level: print sample X then predict+aggregate
+        if show_predict_samples:
+            X_alias = post_cap[["Capacity", "numCases", "StaffGroup"]].copy()
+            X_alias["StaffGroup"] = X_alias["StaffGroup"].astype("string").fillna("__MISSING__")
+            print("\n[DEBUG] Alias-level POST predict() input (first 12 rows):")
+            print(X_alias.head(12).to_string(index=False))
+            print("Rows to predict (alias-level):", len(X_alias))
+
+        grid_post = predict_post_from_cap_and_cases(
+            post_df=post_cap,
+            models=models,
+            targets=targets,
+            team_aggregate="median",
+            debug_sample=False,
+        )
+
+    else:
+        # Team-level: aggregate inputs first, then predict once per team
+        team_post = (post_cap.groupby("StaffGroup", as_index=False)[["Capacity","numCases"]]
+                     .median())
+        X_team = team_post.copy()
+        X_team["StaffGroup"] = X_team["StaffGroup"].astype("string").fillna("__MISSING__")
+
+        if show_predict_samples:
+            print("\n[DEBUG] Team-level POST predict() input (first 12 rows):")
+            print(X_team.head(12).to_string(index=False))
+            print("Rows to predict (team-level):", len(X_team))
+
+        preds = {"StaffGroup": X_team["StaffGroup"].to_numpy()}
+        for t in targets:
+            preds[t] = models[t].predict(X_team[["Capacity","numCases","StaffGroup"]])
+        grid_post = pd.DataFrame(preds).merge(team_post, on="StaffGroup", how="left")
+
+    # Filter to impacted teams if requested (safe)
+    if only_impacted:
+        impacted = get_impacted_sgs(moves)
+        pre_mask  = grid_pre["StaffGroup"].isin(impacted)
+        post_mask = grid_post["StaffGroup"].isin(impacted)
+        if pre_mask.any():
+            grid_pre  = grid_pre[pre_mask]
+        else:
+            print("[WARN] No PRE rows match impacted teams; leaving PRE unfiltered.")
+        if post_mask.any():
+            grid_post = grid_post[post_mask]
+        else:
+            print("[WARN] No POST rows match impacted teams; leaving POST unfiltered.")
+
+    # Combine to the same table-like shape you had before
+    gp = grid_pre.copy(); gp["Scenario"] = "Pre"
+    gq = grid_post.copy(); gq["Scenario"] = "Post (pred)"
+    combined = (pd.concat([gp, gq], ignore_index=True)
+                  .sort_values(["StaffGroup", "Scenario"])
+                  .reset_index(drop=True))
+
+    # Keep your original color table (or the sanity-highlighted one you just added)
+    grid_for_plot = combined.copy()
+    grid_for_plot["StaffGroup"] = grid_for_plot["StaffGroup"] + " — " + grid_for_plot["Scenario"].astype(str)
+    fig = plot_color_grid(grid_for_plot, title="Pre vs. Post Simulation (Cap + numCases)")
+
+    return grid_pre, grid_post, combined, fig, mse_report, sanity_df
