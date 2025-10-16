@@ -95,26 +95,30 @@ class OptimizeConfig:
 # =========================
 # Constants
 # =========================
-FEATURE_DIRECTION: Dict[str, bool] = {
-    "numCases": True, "numOpenCases": True, "backlog": True, "TimeSpent": True,
-    "currentSevA": True, "Is24X7OptedIn": True, "IsClosedOnWeekend": True,
-    "tenure": False, "som": False, "avgDaysToClose": True, "efficiency": False,
-    "CustomerSatisfaction": False, "ActiveCases": True, "TenureInMonths": False,
-    "EfficiencyRating": False, "AvgTimeToResolve": True, "TasksCompleted": True,
-    "BacklogSize": True
-}
+# FEATURE_DIRECTION: Dict[str, bool] = {
+#     "numCases": True, "numOpenCases": True, "backlog": True, "TimeSpent": True,
+#     "currentSevA": True, "Is24X7OptedIn": True, "IsClosedOnWeekend": True,
+#     "tenure": False, "som": False, "avgDaysToClose": True, "efficiency": False,
+#     "CustomerSatisfaction": False, "ActiveCases": True, "TenureInMonths": False,
+#     "EfficiencyRating": False, "AvgTimeToResolve": True, "TasksCompleted": True,
+#     "BacklogSize": True
+# }
 
 
 # =========================
 # Utils
 # =========================
-def _mstart(x):
-    """Converts a date or Series of dates to the start of the month."""
-    dates = pd.to_datetime(x, errors="coerce")
-    if isinstance(dates, pd.Series):
-        return dates.dt.to_period("M").dt.to_timestamp()
-    else:
-        return dates.to_period("M").to_timestamp()
+def _mstart(s):
+    """
+    Normalize datetime-like Series/array/scalar to month-start Timestamp(s).
+    Works for pandas Series/Index/list-likes and scalars.
+    """
+    x = pd.to_datetime(s, errors="coerce")
+    # Series / Index / list-like → has .dt
+    if hasattr(x, "dt"):
+        return x.dt.to_period("M").dt.to_timestamp()
+    # scalar datetime
+    return pd.to_datetime(x).to_period("M").to_timestamp()
 
 def robust_minmax(series: pd.Series, feature_range=(0, 100), qlow=1, qhigh=99, distribution="linear"):
     arr = np.asarray(series.dropna())
@@ -403,6 +407,8 @@ def fit_tree_models(train_df: pd.DataFrame, *, targets):
 #     cur = cur.groupby("StaffGroup").apply(predict_group_capacity).reset_index(drop=True)
 #     return cur.groupby("StaffGroup")["Capacity"].median().reset_index()
 
+
+
 # =========================
 # simulate_post_capacity()
 # =========================
@@ -420,20 +426,36 @@ def simulate_post_capacity(
     alias_col: str = "alias",
     sg_col: str = "StaffGroup",
     cap_col_baseline: str = "Capacity_Score_0_100",
-    # optional deviation features for capacity re-estimation (if available)
+    # optional deviation features for KNN
     features_dev_cols: list[str] | None = None,
-    use_knn: bool = True,
+    use_knn: bool = False,
     knn_k: int = 5,
     # workload rebalancing
     rebalance_workload: bool = True,
     workload_cols: list[str] = ["numCases"],
-    rebalance_method: str = "proportional",
+    rebalance_method: str = "proportional",  # or "even"
+    # NEW: recompute post capacity sequence options
+    recompute_capacity_post: bool = False,
+    capacity_method: str = "scorer",         # "scorer" | "knn" | "numcases_model"
+    prep=None,                                # fitted DataPrep (for "scorer"/"knn")
+    scorer=None,                              # fitted CapacityScorer (for "scorer")
+    capacity_features: list[str] | None = None,
+    numcases_model=None,                      # sklearn Pipeline from fit_capacity_from_numcases_model
+    numcases_col_for_model: str = "numCases",
     # misc
     random_state: int | None = 42,
     verbose: bool = True
 ) -> pd.DataFrame:
+    """
+    Simulate a post-move alias-level frame for a single month:
+      1) Filter to month m0
+      2) Merge baseline Capacity → 'Capacity'
+      3) Apply move plan (update StaffGroup for moved aliases)
+      4) Rebalance workload within donor/host teams (preserve PRE team totals)
+      5) Optionally recompute alias-level Capacity (scorer/knn/numcases_model)
+      6) Return alias-level post table
+    """
     rng = np.random.default_rng(random_state)
-
     m0 = pd.to_datetime(month, errors="coerce").to_period("M").to_timestamp()
 
     base = df_in.copy()
@@ -441,11 +463,14 @@ def simulate_post_capacity(
         raise ValueError(f"simulate_post_capacity: '{date_col}' not found in df_in.")
     base[date_col] = pd.to_datetime(base[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
     base = base.loc[base[date_col] == m0].copy()
+    if base.empty:
+        raise ValueError("No rows in df_in for the requested month.")
 
     missing_min = {alias_col, sg_col} - set(base.columns)
     if missing_min:
-        raise ValueError(f"simulate_post_capacity: missing required columns in df_in month-slice: {missing_min}")
+        raise ValueError(f"simulate_post_capacity: missing columns in df_in month-slice: {missing_min}")
 
+    # Merge baseline capacity
     if not {date_col, alias_col}.issubset(scores_baseline.columns):
         raise ValueError("simulate_post_capacity: scores_baseline must contain date_col and alias_col.")
     sb = scores_baseline[[date_col, alias_col, cap_col_baseline]].copy()
@@ -461,14 +486,16 @@ def simulate_post_capacity(
     if verbose:
         print(f"Simulating moves for month={m0.date()} ...")
 
+    # Apply moves
     team_aliases = post.groupby(sg_col)[alias_col].apply(list).to_dict()
     affected_teams = set()
     for mv in moves or []:
         donor = mv.get("from"); host = mv.get("to"); k = int(mv.get("n", 0) or 0)
-        if not donor or not host or k <= 0: continue
+        if not donor or not host or k <= 0:
+            continue
         donor_aliases = list(team_aliases.get(donor, []))
         if not donor_aliases:
-            if verbose: print(f"  • [SKIP] Donor '{donor}' has no aliases to move.")
+            if verbose: print(f"  • [SKIP] Donor '{donor}' empty.")
             continue
         moved = donor_aliases[:] if len(donor_aliases) <= k else list(rng.choice(donor_aliases, size=k, replace=False))
         post.loc[post[alias_col].isin(moved), sg_col] = host
@@ -477,92 +504,39 @@ def simulate_post_capacity(
         affected_teams.update([donor, host])
         if verbose: print(f"  • Move {len(moved)} aliases: {donor} → {host}")
 
-    def _reestimate_capacity_knn(base_df: pd.DataFrame, post_df: pd.DataFrame):
-        try:
-            from sklearn.neighbors import KNeighborsRegressor
-        except Exception:
-            return None
-        if not features_dev_cols: return None
-        need_cols = ["Capacity"] + features_dev_cols
-        if not all(c in base_df.columns for c in need_cols): return None
-        if not all(c in post_df.columns for c in features_dev_cols): return None
-        fit_df = base_df[[alias_col, sg_col, "Capacity"] + features_dev_cols].dropna().copy()
-        if fit_df["Capacity"].notna().sum() < max(20, knn_k + 5): return None
-
-        preds = {}
-        for team in post_df[sg_col].dropna().unique().tolist():
-            fit_t = fit_df.loc[fit_df[sg_col] == team]
-            need_t = post_df.loc[post_df[sg_col] == team, [alias_col] + features_dev_cols].copy()
-            if len(fit_t) >= max(knn_k + 2, 10) and not need_t.empty:
-                k_use = min(knn_k, len(fit_t))
-                knn = KNeighborsRegressor(n_neighbors=k_use)
-                knn.fit(fit_t[features_dev_cols], fit_t["Capacity"])
-                preds_t = knn.predict(need_t[features_dev_cols])
-                for a, yhat in zip(need_t[alias_col].tolist(), preds_t.tolist()):
-                    preds[a] = float(yhat)
-        return preds
-
-    knn_preds = _reestimate_capacity_knn(base, post) if use_knn else None
-    if knn_preds:
-        post["Capacity_post_est"] = post[alias_col].map(knn_preds)
-        team_med = post.groupby(sg_col, as_index=False)["Capacity"].median().rename(columns={"Capacity": "Capacity_team_med"})
-        post = post.merge(team_med, on=sg_col, how="left")
-        post["Capacity"] = post["Capacity_post_est"].fillna(post["Capacity_team_med"])
-        post.drop(columns=["Capacity_post_est", "Capacity_team_med"], inplace=True, errors="ignore")
-        if verbose: print("  • Capacity re-estimated via KNN where possible; others filled by team medians.")
-    else:
-        if post["Capacity"].notna().any():
-            team_med = post.groupby(sg_col, as_index=False)["Capacity"].median().rename(columns={"Capacity": "Capacity_team_med"})
-            post = post.merge(team_med, on=sg_col, how="left")
-            post["Capacity"] = post["Capacity"].fillna(post["Capacity_team_med"])
-            post.drop(columns=["Capacity_team_med"], inplace=True, errors="ignore")
-        else:
-            post["Capacity"] = post["Capacity"].fillna(50.0)
-        if verbose: print("  • Capacity set by team medians (or fallback).")
-
-    # Diagnostics + bulletproof fill
-    n_alias = post[alias_col].nunique(); n_cap0 = post["Capacity"].notna().sum()
-    if verbose: print(f"  • Capacity merge: {n_cap0}/{n_alias} aliases have baseline capacity")
-    post["Capacity"] = post["Capacity"].where(post["Capacity"].notna(), post.groupby(sg_col)["Capacity"].transform("median"))
-    if post["Capacity"].isna().any():
-        gmed = post["Capacity"].median()
-        if np.isfinite(gmed): post["Capacity"] = post["Capacity"].fillna(gmed)
-    post["Capacity"] = post["Capacity"].fillna(50.0)
-    n_cap1 = post["Capacity"].notna().sum()
-    if verbose and n_cap1 < n_alias: print(f"  • [WARN] {n_alias - n_cap1} aliases still lacked Capacity after fills — set to 50.0")
-
+    # Rebalance workload (preserve PRE totals)
     if rebalance_workload and workload_cols:
         pre_totals = base.groupby(sg_col, as_index=False)[workload_cols].sum()
+
         def _distribute(total, size, weights=None):
             if size <= 0: return np.array([])
             if rebalance_method == "proportional" and weights is not None and weights.sum() > 0:
-                w = weights / weights.sum(); return total * w
+                w = weights / weights.sum()
+                return total * w
             return np.full(size, total / size if size > 0 else 0.0)
 
-        team_aliases = post.groupby(sg_col)[alias_col].apply(list).to_dict()
-        teams_to_rebalance = set(team_aliases.keys()) if not affected_teams else affected_teams
+        post_aliases = post.groupby(sg_col)[alias_col].apply(list).to_dict()
+        teams_to_rebalance = set(post_aliases.keys()) if not affected_teams else affected_teams
+
         for team in teams_to_rebalance:
-            aliases = team_aliases.get(team, [])
+            aliases = post_aliases.get(team, [])
             if not aliases: continue
-            if team in set(pre_totals[sg_col]):
-                row = pre_totals.loc[pre_totals[sg_col] == team]
+
+            row = pre_totals.loc[pre_totals[sg_col] == team]
+            team_total = float(row[workload_cols[0]].values[0]) if not row.empty else float(post.loc[post[sg_col]==team, workload_cols[0]].sum())
+
+            if rebalance_method == "proportional" and workload_cols[0] in base.columns:
+                pre_alias = base.loc[base[sg_col]==team, [alias_col, workload_cols[0]]].groupby(alias_col, as_index=False)[workload_cols[0]].sum()
+                pre_alias = pre_alias.set_index(alias_col).reindex(aliases).fillna(0.0)
+                weights = pre_alias[workload_cols[0]].to_numpy()
             else:
-                row = pd.DataFrame([{sg_col: team, **{c: post.loc[post[sg_col]==team, c].sum() for c in workload_cols}}])
-            for col in workload_cols:
-                team_total = float(row[col].values[0]) if col in row.columns else 0.0
-                if col in base.columns:
-                    pre_alias = base.loc[base[sg_col]==team, [alias_col, col]].groupby(alias_col, as_index=False)[col].sum() \
-                                .set_index(alias_col).reindex(aliases).fillna(0.0)
-                    weights = pre_alias[col].to_numpy()
-                elif col in post.columns:
-                    cur_alias = post.loc[post[sg_col]==team, [alias_col, col]].groupby(alias_col, as_index=False)[col].sum() \
-                                .set_index(alias_col).reindex(aliases).fillna(0.0)
-                    weights = cur_alias[col].to_numpy()
-                else:
-                    weights = None
-                distr = _distribute(team_total, len(aliases), weights)
-                if col not in post.columns: post[col] = np.nan
-                post.loc[post[alias_col].isin(aliases), col] = distr
+                cur_alias = post.loc[post[sg_col]==team, [alias_col, workload_cols[0]]].groupby(alias_col, as_index=False)[workload_cols[0]].sum()
+                cur_alias = cur_alias.set_index(alias_col).reindex(aliases).fillna(0.0)
+                weights = cur_alias[workload_cols[0]].to_numpy()
+
+            distr = _distribute(team_total, len(aliases), weights)
+            if workload_cols[0] not in post.columns: post[workload_cols[0]] = np.nan
+            post.loc[post[alias_col].isin(aliases), workload_cols[0]] = distr
 
         if verbose:
             post_totals = post.groupby(sg_col, as_index=False)[workload_cols].sum()
@@ -573,8 +547,93 @@ def simulate_post_capacity(
                 deltas.append(f"{col}: Δ={diff:.3f}")
             print("  • Workload rebalanced (team totals preserved):", ", ".join(deltas))
 
+    # ======= NEW: recompute post Capacity after redistribution (optional) =======
+    if recompute_capacity_post:
+        # Build a post-world raw frame for rescoring
+        base_m = df_in.copy()
+        base_m[date_col] = pd.to_datetime(base_m[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        base_m = base_m.loc[base_m[date_col] == m0].copy()
+
+        id_cols = [alias_col, date_col, sg_col]
+        if capacity_features is None:
+            keep_feats = base_m.select_dtypes(include=["number","bool"]).columns.tolist()
+        else:
+            keep_feats = [c for c in capacity_features if c in base_m.columns]
+        post_raw = base_m[id_cols + keep_feats].copy()
+
+        # override StaffGroup + numCases from simulated post
+        override_cols = [c for c in [sg_col, "numCases"] if c in post.columns]
+        post_raw = (post_raw
+                    .drop(columns=[c for c in override_cols if c in post_raw.columns], errors="ignore")
+                    .merge(post[[alias_col, date_col] + override_cols], on=[alias_col, date_col], how="left"))
+
+        if capacity_method == "scorer":
+            if prep is None or scorer is None:
+                raise ValueError("recompute_capacity_post=True + capacity_method='scorer' requires fitted `prep` and `scorer`.")
+            post_prepped = prep.transform(post_raw)
+            post_scored  = scorer.transform(post_prepped, group_col=sg_col, id_cols=(alias_col, date_col))
+            post_cap_new = post_scored[[alias_col, date_col, "Capacity_Score_0_100"]] \
+                               .rename(columns={"Capacity_Score_0_100":"Capacity"})
+
+        elif capacity_method == "knn":
+            if prep is None:
+                raise ValueError("capacity_method='knn' requires fitted `prep` to compute deviations.")
+            from sklearn.neighbors import KNeighborsRegressor
+            pre_prepped = prep.transform(base)
+            z_cols = [c for c in pre_prepped.columns if c.startswith("Z_") or c.endswith("_Dev")]
+            y_pre = scores_baseline[[date_col, alias_col, cap_col_baseline]].copy()
+            y_pre[date_col] = pd.to_datetime(y_pre[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+            y_pre = y_pre.loc[y_pre[date_col] == m0]
+            train = pre_prepped.merge(y_pre.rename(columns={cap_col_baseline:"Capacity_Score_0_100"}),
+                                      on=[date_col, alias_col], how="left")
+            post_prepped = prep.transform(post_raw)
+
+            preds = {}
+            for team, need_blk in post_prepped.groupby(sg_col):
+                fit_blk = train[train[sg_col] == team]
+                if fit_blk.empty or need_blk.empty: continue
+                X_fit = fit_blk[z_cols].fillna(0.0).to_numpy()
+                y_fit = pd.to_numeric(fit_blk["Capacity_Score_0_100"], errors="coerce").fillna(0.0).to_numpy()
+                X_need = need_blk[z_cols].fillna(0.0).to_numpy()
+                k_use = max(2, min(knn_k, len(fit_blk)))
+                knn = KNeighborsRegressor(n_neighbors=k_use, weights="distance")
+                knn.fit(X_fit, y_fit)
+                y_pred = knn.predict(X_need)
+                for a, d, yhat in zip(need_blk[alias_col].tolist(), need_blk[date_col].tolist(), y_pred.tolist()):
+                    preds[(a, d)] = float(yhat)
+            post_cap_new = post_raw[[alias_col, date_col]].copy()
+            post_cap_new["Capacity"] = [preds.get((a, d), np.nan) for a, d in zip(post_cap_new[alias_col], post_cap_new[date_col])]
+
+        elif capacity_method == "numcases_model":
+            if numcases_model is None:
+                raise ValueError("capacity_method='numcases_model' requires a trained `numcases_model`.")
+            # predict Capacity from (numCases, StaffGroup) AFTER redistribution
+            Xp = post_raw[[numcases_col_for_model, sg_col]].copy()
+            Xp[sg_col] = Xp[sg_col].astype("string").fillna("__MISSING__")
+            Xp[numcases_col_for_model] = pd.to_numeric(Xp[numcases_col_for_model], errors="coerce").fillna(0.0)
+            yhat = numcases_model.predict(Xp)
+            post_cap_new = post_raw[[alias_col, date_col]].copy()
+            post_cap_new["Capacity"] = yhat
+
+        else:
+            raise ValueError("capacity_method must be 'scorer' | 'knn' | 'numcases_model'.")
+
+        # merge back and guard
+        post = (post.drop(columns=["Capacity"], errors="ignore")
+                    .merge(post_cap_new, on=[alias_col, date_col], how="left"))
+        post["Capacity"] = post["Capacity"].where(
+            post["Capacity"].notna(),
+            post.groupby(sg_col)["Capacity"].transform("median")
+        )
+        if post["Capacity"].isna().any():
+            gmed = post["Capacity"].median()
+            if np.isfinite(gmed):
+                post["Capacity"] = post["Capacity"].fillna(gmed)
+        post["Capacity"] = post["Capacity"].fillna(50.0)
+
+    # Final ordering
     cols_front = [date_col, alias_col, sg_col, "Capacity"]
-    cols_work = [c for c in workload_cols if c in post.columns]
+    cols_work  = [c for c in workload_cols if c in post.columns]
     other_cols = [c for c in post.columns if c not in set(cols_front + cols_work)]
     post = post[cols_front + cols_work + other_cols].copy()
     post = post.sort_values([alias_col, date_col]).drop_duplicates(subset=[alias_col, date_col], keep="last")
@@ -1333,155 +1392,6 @@ def predict_post_from_cap_and_cases(
     return grid_post
 
 
-# ---- NEW: a parallel pipeline that uses Capacity + numCases + StaffGroup
-from typing import Optional, List, Dict, Tuple
-
-# def pre_post_tree_pipeline_cap_cases(
-#     df_in: pd.DataFrame, scores_baseline: pd.DataFrame, month: str, moves: List[Dict], *,
-#     compute_wsi_fn, wsi_kwargs: Optional[dict] = None,
-#     targets: Tuple[str, ...] = ("WSI_0_100", "efficiency", "days_to_close", "backlog"),
-#     only_impacted: bool = True,
-#     team_level_post: bool = False,       # keep both modes
-#     show_predict_samples: bool = True,
-# ):
-#     """
-#     Same outputs as your original function, but the outcome models are trained with
-#     features: Capacity + numCases + StaffGroup, and predictions consume numCases_post.
-#     """
-#     # 0) Prepare training data (same helper you already use)
-#     train_df = prepare_training_df(df_in, scores_baseline,
-#                                    compute_wsi_fn=compute_wsi_fn, wsi_kwargs=wsi_kwargs)
-
-#     # Safety: ensure required columns exist
-#     need_train = {"StaffGroup", "_date_", "Capacity", "numCases", *targets}
-#     missing = [c for c in need_train if c not in train_df.columns]
-#     if missing:
-#         raise ValueError(f"pre_post_tree_pipeline_cap_cases: training data missing columns: {missing}")
-
-#     # Fit models using Capacity + numCases + StaffGroup
-#     models, mse_report = fit_tree_models_from_features(
-#         train_df=train_df,
-#         targets=targets,
-#         num_features=["Capacity", "numCases"],
-#         cat_features=["StaffGroup"],
-#     )
-
-#     # PRE month & grid (actuals, team median)
-#     m0 = _mstart(month)
-#     pre_month = train_df[train_df["_date_"] == m0].copy()
-#     grid_pre = (pre_month.groupby("StaffGroup")[["Capacity", "numCases", *targets]]
-#                 .median().reset_index())
-
-#     # Sanity IQR based on alias-level PRE
-#     sanity_ranges = {}
-#     for metric in ["Capacity", "numCases", *targets]:
-#         if metric in pre_month.columns:
-#             q1 = pre_month[metric].quantile(0.25)
-#             q3 = pre_month[metric].quantile(0.75)
-#             sanity_ranges[metric] = f"{q1:.2f} to {q3:.2f}"
-#     sanity_df = (pd.DataFrame.from_dict(sanity_ranges, orient='index',
-#                                         columns=['Typical Range (25th-75th percentile)'])
-#                  .rename_axis("Metric"))
-
-#     # POST capacity simulation
-#     post_cap = simulate_post_capacity(df_in, scores_baseline, month, moves).copy()
-
-#     # Normalize month and column names
-#     if "_date_" in post_cap.columns:
-#         post_cap["_date_"] = pd.to_datetime(post_cap["_date_"]).dt.to_period("M").dt.to_timestamp()
-#         post_cap = post_cap[post_cap["_date_"] == m0].copy()
-#     if "Capacity" not in post_cap.columns and "Capacity_Score_0_100" in post_cap.columns:
-#         post_cap = post_cap.rename(columns={"Capacity_Score_0_100": "Capacity"})
-
-#     # Ensure numCases_post exists; if not present, try a reasonable fallback
-#     if "numCases" not in post_cap.columns:
-#         # Fallback: use PRE team median numCases
-#         team_cases_pre = pre_month.groupby("StaffGroup", as_index=False)["numCases"].median()
-#         post_cap = post_cap.merge(team_cases_pre, on="StaffGroup", how="left")
-#         print("[WARN] simulate_post_capacity did not provide 'numCases'; using PRE team medians as a fallback.")
-
-#     # POST prediction:
-#     # - alias-level (default): predict per alias then aggregate
-#     # - team-level: aggregate (Capacity,numCases) to team, predict once per team
-#     if not team_level_post:
-#         # Alias-level: print sample X then predict+aggregate
-#         if show_predict_samples:
-#             X_alias = post_cap[["Capacity", "numCases", "StaffGroup"]].copy()
-#             X_alias["StaffGroup"] = X_alias["StaffGroup"].astype("string").fillna("__MISSING__")
-#             print("\n[DEBUG] Alias-level POST predict() input (first 12 rows):")
-#             print(X_alias.head(12).to_string(index=False))
-#             print("Rows to predict (alias-level):", len(X_alias))
-
-#         grid_post = predict_post_from_cap_and_cases(
-#             post_df=post_cap,
-#             models=models,
-#             targets=targets,
-#             team_aggregate="median",
-#             debug_sample=False,
-#         )
-
-#     else:
-#         # Team-level: aggregate inputs first, then predict once per team
-#         team_post = (post_cap.groupby("StaffGroup", as_index=False)[["Capacity","numCases"]]
-#                      .median())
-#         X_team = team_post.copy()
-#         X_team["StaffGroup"] = X_team["StaffGroup"].astype("string").fillna("__MISSING__")
-
-#         if show_predict_samples:
-#             print("\n[DEBUG] Team-level POST predict() input (first 12 rows):")
-#             print(X_team.head(12).to_string(index=False))
-#             print("Rows to predict (team-level):", len(X_team))
-
-#         preds = {"StaffGroup": X_team["StaffGroup"].to_numpy()}
-#         for t in targets:
-#             preds[t] = models[t].predict(X_team[["Capacity","numCases","StaffGroup"]])
-#         grid_post = pd.DataFrame(preds).merge(team_post, on="StaffGroup", how="left")
-
-#     # Filter to impacted teams if requested (safe)
-#     if only_impacted:
-#         impacted = get_impacted_sgs(moves)
-#         pre_mask  = grid_pre["StaffGroup"].isin(impacted)
-#         post_mask = grid_post["StaffGroup"].isin(impacted)
-#         if pre_mask.any():
-#             grid_pre  = grid_pre[pre_mask]
-#         else:
-#             print("[WARN] No PRE rows match impacted teams; leaving PRE unfiltered.")
-#         if post_mask.any():
-#             grid_post = grid_post[post_mask]
-#         else:
-#             print("[WARN] No POST rows match impacted teams; leaving POST unfiltered.")
-
-#     # Combine to the same table-like shape you had before
-#     gp = grid_pre.copy(); gp["Scenario"] = "Pre"
-#     gq = grid_post.copy(); gq["Scenario"] = "Post (pred)"
-#     combined = (pd.concat([gp, gq], ignore_index=True)
-#                   .sort_values(["StaffGroup", "Scenario"])
-#                   .reset_index(drop=True))
-
-#     # Keep your original color table (or the sanity-highlighted one you just added)
-#     grid_for_plot = combined.copy()
-#     grid_for_plot["StaffGroup"] = grid_for_plot["StaffGroup"] + " — " + grid_for_plot["Scenario"].astype(str)
-#     fig = plot_color_grid(grid_for_plot, title="Pre vs. Post Simulation (Cap + numCases)")
-
-#     return grid_pre, grid_post, combined, fig, mse_report, sanity_df
-
-# # ==== CAUSAL SEQUENCE HELPERS ====
-# # Stage order: backlog → days_to_close → efficiency → WSI_0_100
-# # Base drivers (always available in post world): Capacity, numCases, StaffGroup
-
-# def _make_regressor(random_state=42):
-#     try:
-#         from xgboost import XGBRegressor
-#         return XGBRegressor(
-#             n_estimators=400, max_depth=6, learning_rate=0.05,
-#             subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
-#             objective="reg:squarederror", n_jobs=-1, random_state=random_state
-#         )
-#     except Exception:
-#         from sklearn.ensemble import RandomForestRegressor
-#         return RandomForestRegressor(n_estimators=500, n_jobs=-1, random_state=random_state)
-
-
 from typing import List, Dict, Tuple, Optional
 import pandas as pd
 import numpy as np
@@ -1642,13 +1552,13 @@ def _ensure_numcases_post(
     post_cap["numCases"] = pd.to_numeric(post_cap["numCases"], errors="coerce").fillna(0.0)
     return post_cap
 
-# ===========================================
-# pre_post_tree_pipeline_cap_cases()
-# (p10–p95 sanity ranges + sanity-highlighted table)
-# ===========================================
+
+# ============================================================
+# pre_post_tree_pipeline_cap_cases (FULL — original behavior + new options)
+# ============================================================
 from typing import List, Dict, Tuple, Optional
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 def pre_post_tree_pipeline_cap_cases(
     df_in: pd.DataFrame,
@@ -1656,6 +1566,7 @@ def pre_post_tree_pipeline_cap_cases(
     month: str,
     moves: List[Dict],
     *,
+    # ----- EXISTING (unchanged) -----
     compute_wsi_fn,
     wsi_kwargs: Optional[dict] = None,
     targets: Tuple[str, ...] = ("WSI_0_100", "efficiency", "days_to_close", "backlog"),
@@ -1664,246 +1575,329 @@ def pre_post_tree_pipeline_cap_cases(
     show_predict_samples: bool = True,
     use_causal_sequence: Optional[object] = False,  # False | True | "learn"
     feature_scope: Optional[List[str]] = None,
-    verbose: bool = True
+    verbose: bool = True,
+
+    # ----- NEW (all optional; defaults keep original behavior) -----
+    # Recompute post Capacity AFTER workload redistribution (your requested sequence)
+    recompute_capacity_post: bool = False,
+    # How to compute post alias Capacity when recompute_capacity_post=True
+    #   "scorer"          → use fitted DataPrep/CapacityScorer to recompute post Capacity_Score_0_100
+    #   "knn"             → per-team KNN on pre deviations predicting post Capacity
+    #   "numcases_model"  → predict Capacity from (numCases + StaffGroup) using a model trained on ALL months
+    capacity_method: str = "scorer",
+    prep=None,                        # fitted DataPrep (required for "scorer" or "knn")
+    scorer=None,                      # fitted CapacityScorer (required for "scorer")
+    capacity_features: Optional[List[str]] = None,  # raw features the scorer expects (optional; scorer can infer)
+    numcases_model=None,              # optional pre-trained model (if None and method="numcases_model", will auto-train)
+    numcases_col_for_model: str = "numCases",
 ):
-    # ---------- helpers ----------
-    def _resolve_and_standardize_numcases(train_df, df_in, post_cap, m0, verbose=True, feature_scope=None):
-        scope = list(feature_scope or []); scope_lower = {c.lower(): c for c in scope}
-        likely = ["numcases","taskscompleted","tasks_completed","activecases","backlogsize","totaltasks","totalevent"]
-        scope_cands = [scope_lower[k] for k in likely if k in scope_lower]
-        defaults = ["numCases","TasksCompleted","ActiveCases","BacklogSize","TotalTasks","TotalEvent"]
-        candidates = scope_cands + [c for c in defaults if c not in scope_cands]
-        used = None
-        if "numCases" not in train_df.columns:
-            for c in candidates:
-                if c in train_df.columns:
-                    train_df["numCases"] = pd.to_numeric(train_df[c], errors="coerce"); used = c; break
-        if "numCases" not in train_df.columns and {"_date_","alias"}.issubset(train_df.columns) and {"_date_","alias"}.issubset(df_in.columns):
-            dfm = df_in.copy()
-            dfm["_date_"] = pd.to_datetime(dfm["_date_"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-            dfm = dfm.loc[dfm["_date_"] == m0]
-            for c in candidates:
-                if c in dfm.columns:
-                    tmp = dfm[["_date_","alias", c]].drop_duplicates()
-                    train_df = train_df.merge(tmp.rename(columns={c:"numCases"}), on=["_date_","alias"], how="left"); used = c; break
-        if "numCases" not in train_df.columns:
-            train_df["numCases"] = 0.0
-            if verbose: print("⚠️  Could not resolve workload for training; defaulted train_df['numCases']=0.")
-        train_df["numCases"] = pd.to_numeric(train_df["numCases"], errors="coerce").fillna(0.0)
+    """
+    End-to-end simulator using Capacity + numCases + StaffGroup as base inputs.
 
-        if not post_cap.empty and "numCases" not in post_cap.columns and "alias" in post_cap.columns:
-            dfm = df_in.copy()
-            dfm["_date_"] = pd.to_datetime(dfm["_date_"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-            dfm = dfm.loc[dfm["_date_"] == m0]
-            for c in ([used] + candidates if used else candidates):
-                if c and c in dfm.columns:
-                    tmp = dfm[["alias", c]].drop_duplicates()
-                    post_cap = post_cap.merge(tmp.rename(columns={c:"numCases"}), on="alias", how="left"); break
-        if not post_cap.empty and "numCases" in post_cap.columns:
-            post_cap["numCases"] = pd.to_numeric(post_cap["numCases"], errors="coerce")
-        return train_df, post_cap, used
+    PRE  = observed medians for the selected month.
+    POST = predictions (direct, fixed-causal, or DAG-learned) from models trained on PRE,
+           supplied with simulated post alias/team inputs (Capacity, numCases, StaffGroup).
 
-    def _ensure_numcases_post(pre_month, post_cap, df_in, m0, feature_scope=None, verbose=True):
-        scope = list(feature_scope or []); scope_lower = {c.lower(): c for c in scope}
-        likely = ["numcases","taskscompleted","tasks_completed","activecases","backlogsize","totaltasks","totalevent"]
-        scope_cands = [scope_lower[k] for k in likely if k in scope_lower]
-        defaults = ["numCases","TasksCompleted","ActiveCases","BacklogSize","TotalTasks","TotalEvent"]
-        candidates = scope_cands + [c for c in defaults if c not in scope_cands]
+    NEW OPTIONS:
+      - recompute_capacity_post=True recomputes post alias Capacity AFTER workload redistribution following your sequence.
+      - capacity_method="scorer" | "knn" | "numcases_model" controls how post Capacity is built.
+        If "numcases_model" and no model provided, this function auto-trains one on ALL months.
+    """
 
-        if "numCases" not in post_cap.columns: post_cap["numCases"] = np.nan
-        if "alias" in post_cap.columns:
-            dfm = df_in.copy()
-            dfm["_date_"] = pd.to_datetime(dfm["_date_"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-            dfm = dfm.loc[dfm["_date_"] == m0]
-            for c in candidates:
-                if c in dfm.columns:
-                    tmp = dfm[["alias", c]].drop_duplicates()
-                    before_na = post_cap["numCases"].isna().sum()
-                    post_cap = post_cap.merge(tmp.rename(columns={c:"numCases_join"}), on="alias", how="left")
-                    post_cap["numCases"] = post_cap["numCases"].fillna(post_cap["numCases_join"])
-                    post_cap.drop(columns=["numCases_join"], inplace=True)
-                    after_na = post_cap["numCases"].isna().sum()
-                    if verbose and before_na != after_na:
-                        print(f"ℹ️  Recovered {before_na - after_na} numCases via alias-join from '{c}'.")
-                    if post_cap["numCases"].notna().any(): break
+    # -------------------- Local helpers (kept inside for easy paste) --------------------
 
-        if post_cap["numCases"].isna().all():
-            pre_num = None
-            if "numCases" in pre_month.columns:
-                pre_num = pre_month[["StaffGroup","numCases"]].copy()
-            else:
-                for c in candidates:
-                    if c in pre_month.columns:
-                        pre_num = pre_month[["StaffGroup", c]].rename(columns={c:"numCases"}); break
-                if pre_num is None and {"StaffGroup"}.issubset(df_in.columns):
-                    dfm = df_in.copy()
-                    dfm["_date_"] = pd.to_datetime(dfm["_date_"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-                    dfm = dfm.loc[dfm["_date_"] == m0]
-                    for c in candidates:
-                        if c in dfm.columns:
-                            pre_num = dfm[["StaffGroup", c]].rename(columns={c:"numCases"}); break
-            if pre_num is not None:
-                pre_team_med = pre_num.groupby("StaffGroup", as_index=False)["numCases"].median().rename(columns={"numCases":"numCases_team_median"})
-                post_cap = post_cap.merge(pre_team_med, on="StaffGroup", how="left")
-                if "numCases" not in post_cap.columns:
-                    post_cap["numCases"] = post_cap["numCases_team_median"]
-                else:
-                    post_cap["numCases"] = post_cap["numCases"].fillna(post_cap["numCases_team_median"])
-                post_cap.drop(columns=["numCases_team_median"], inplace=True, errors="ignore")
+    def _mstart(s):
+        """
+        Normalize datetime-like Series/array/scalar to month-start Timestamp(s).
+        Works for pandas Series/Index/list-likes and scalars.
+        """
+        x = pd.to_datetime(s, errors="coerce")
+        # Series / Index / list-like → has .dt
+        if hasattr(x, "dt"):
+            return x.dt.to_period("M").dt.to_timestamp()
+        # scalar datetime
+        return pd.to_datetime(x).to_period("M").to_timestamp()
 
-        post_cap["numCases"] = pd.to_numeric(post_cap["numCases"], errors="coerce").fillna(0.0)
-        return post_cap  # <<< FIX: return it!
+    def _ensure_models_direct(train_df: pd.DataFrame):
+        """Fit direct per-target models: y ~ Capacity + numCases + StaffGroup"""
+        if "fit_tree_models_from_features" not in globals():
+            raise RuntimeError("fit_tree_models_from_features is not available in globals().")
+        _targets = tuple([t for t in targets if t in train_df.columns])
+        return fit_tree_models_from_features(
+            train_df=train_df,
+            targets=_targets,
+            num_features=["Capacity", "numCases"],
+            cat_features=["StaffGroup"],
+        )
 
-    def plot_color_grid_with_sanity_range(combined_table, sanity_df, *, metrics=None,
-                                          low_col="p10", high_col="p95",
-                                          soft_color="rgba(255, 99, 71, 0.18)", base_color="rgba(0,0,0,0)",
-                                          title="Pre vs. Post (sanity-flagged cells: outside p10–p95)"):
-        import plotly.graph_objects as go
-        df = combined_table.copy()
-        df["Row"] = df["StaffGroup"].astype(str) + " — " + df["Scenario"].astype(str)
-        default_metrics = ["Capacity","numCases","WSI_0_100","efficiency","days_to_close","backlog"]
-        if metrics is None: metrics = [m for m in default_metrics if m in df.columns]
-        show_df = df[["Row"] + metrics].copy()
-        if low_col not in sanity_df.columns or high_col not in sanity_df.columns:
-            raise ValueError(f"sanity_df must include columns '{low_col}' and '{high_col}'")
-        s_tbl = sanity_df.copy(); s_tbl.index = s_tbl.index.astype(str)
-        fillcolors = [[base_color] * len(show_df)]
-        for metric in metrics:
-            col = pd.to_numeric(show_df[metric], errors="coerce")
-            if metric in s_tbl.index:
-                lo = float(s_tbl.loc[metric, low_col]); hi = float(s_tbl.loc[metric, high_col])
-                mask = (col < lo) | (col > hi)
-                fillcolors.append([soft_color if bool(m) else base_color for m in mask])
-            else:
-                fillcolors.append([base_color] * len(col))
-        header_values = ["StaffGroup — Scenario"] + metrics
-        cell_values = [show_df[c].tolist() for c in ["Row"] + metrics]
-        fig = go.Figure(data=[go.Table(header=dict(values=header_values, fill_color="rgba(240,240,240,1)", align="left"),
-                                       cells=dict(values=cell_values, fill_color=fillcolors, align="left",
-                                                  format=[None] + [".2f"]*len(metrics)))])
-        fig.update_layout(title=title, margin=dict(l=10, r=10, t=40, b=10))
-        return fig
+    def _ensure_models_dag_fixed(train_df: pd.DataFrame, seq: List[str]):
+        """Fit DAG/fixed causal models (stage-wise)."""
+        if "fit_tree_models_dag" not in globals():
+            raise RuntimeError("fit_tree_models_dag is not available in globals().")
+        return fit_tree_models_dag(
+            train_df=train_df,
+            seq=seq,
+            base_features=("Capacity","numCases","StaffGroup"),
+            feature_scope=feature_scope
+        )
 
-    # ---------- TRAIN ----------
-    train_df = prepare_training_df(df_in=df_in, scores_baseline=scores_baseline,
-                                   compute_wsi_fn=compute_wsi_fn, wsi_kwargs=wsi_kwargs)
+    def _ensure_models_dag_learn(train_df: pd.DataFrame):
+        """Learn DAG order and fit models."""
+        if "learn_sequence_from_data" not in globals() or "fit_tree_models_dag" not in globals():
+            raise RuntimeError("DAG helpers not available (learn_sequence_from_data / fit_tree_models_dag).")
+        seq, _G = learn_sequence_from_data(
+            train_df=train_df,
+            candidate_targets=tuple([t for t in ["backlog","days_to_close","efficiency","WSI_0_100"] if t in train_df.columns]),
+            base_features=("Capacity","numCases","StaffGroup"),
+            feature_scope=feature_scope,
+            k=6,
+            verbose=verbose
+        )
+        models, mse_report = fit_tree_models_dag(
+            train_df=train_df,
+            seq=seq,
+            base_features=("Capacity","numCases","StaffGroup"),
+            feature_scope=feature_scope
+        )
+        return models, mse_report, seq
+
+    def _plot_sanity_table(combined: pd.DataFrame, sanity_df: pd.DataFrame, title: str):
+        """Prefer sanity-flagged table if available; else fallback to color grid."""
+        metrics = [m for m in ["Capacity","numCases","WSI_0_100","efficiency","days_to_close","backlog"] if m in combined.columns]
+        if "plot_color_grid_with_sanity_range" in globals():
+            return plot_color_grid_with_sanity_range(
+                combined_table=combined,
+                sanity_df=sanity_df,
+                metrics=metrics,
+                low_col="p10", high_col="p95",
+                title=title,
+            )
+        # Fallback to old plotter if sanity plot not present
+        if "plot_color_grid" in globals():
+            grid_for_plot = combined.copy()
+            grid_for_plot["StaffGroup"] = grid_for_plot["StaffGroup"] + " — " + grid_for_plot["Scenario"].astype(str)
+            return plot_color_grid(grid_for_plot, title=title)
+        raise RuntimeError("No plotting helper found (plot_color_grid_with_sanity_range or plot_color_grid).")
+
+    def _fit_capacity_from_numcases_model(df_full: pd.DataFrame,
+                                        scores: pd.DataFrame,
+                                        wsi_kwargs: dict,
+                                        numcases_col: str = "numCases",
+                                        random_state: int = 42):
+        """
+        Auto-train Capacity ~ f(numCases, StaffGroup) on ALL months.
+        Column names are inferred from wsi_kwargs (alias_col, date_col, sg_col)
+        with safe canonical defaults if missing.
+        """
+        # infer column names from wsi_kwargs (safe defaults)
+        alias_col = wsi_kwargs.get("alias_col", "alias")
+        date_col  = wsi_kwargs.get("date_col",  "_date_")
+        group_col = wsi_kwargs.get("sg_col",    "StaffGroup")
+
+        # If the global trainer exists and takes a ColumnMap, we can still call it,
+        # but we won't rely on a global `cols`. Build features directly instead.
+        from sklearn.compose import ColumnTransformer
+        from sklearn.preprocessing import OneHotEncoder
+        from sklearn.pipeline import Pipeline
+
+        try:
+            from xgboost import XGBRegressor
+            Regr = XGBRegressor(
+                n_estimators=500, max_depth=6, learning_rate=0.06,
+                subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
+                objective="reg:squarederror", n_jobs=-1, random_state=random_state
+            )
+        except Exception:
+            from sklearn.ensemble import RandomForestRegressor
+            Regr = RandomForestRegressor(n_estimators=600, random_state=random_state, n_jobs=-1)
+
+        # Build the training set across ALL months
+        df = df_full[[alias_col, date_col, group_col, numcases_col]].copy()
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+        y = scores[[alias_col, date_col, "Capacity_Score_0_100"]].copy()
+        y[date_col] = pd.to_datetime(y[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+        data = (df.merge(y, on=[alias_col, date_col], how="inner")
+                .dropna(subset=[numcases_col, "Capacity_Score_0_100"]))
+        if data.empty:
+            raise ValueError("No rows to train capacity-from-numCases model; check inputs.")
+
+        X = data[[numcases_col, group_col]].copy()
+        X[group_col] = X[group_col].astype("string").fillna("__MISSING__")
+        X[numcases_col] = pd.to_numeric(X[numcases_col], errors="coerce").fillna(0.0)
+        y = pd.to_numeric(data["Capacity_Score_0_100"], errors="coerce")
+
+        pre = ColumnTransformer(
+            transformers=[
+                ("num", "passthrough", [numcases_col]),
+                ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), [group_col]),
+            ],
+            remainder="drop",
+        )
+        pipe = Pipeline([("prep", pre), ("regr", Regr)])
+        pipe.fit(X, y)
+        return pipe
+
+    # -------------------- 0) Build TRAIN data --------------------
+    # Note: prepare_training_df must exist in your module; we keep the original call
+    train_df = prepare_training_df(
+        df_in=df_in,
+        scores_baseline=scores_baseline,
+        compute_wsi_fn=compute_wsi_fn,
+        wsi_kwargs=wsi_kwargs,
+    )
     if "_date_" in train_df.columns:
-        train_df["_date_"] = pd.to_datetime(train_df["_date_"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        train_df["_date_"] = _mstart(train_df["_date_"])
     if "Capacity" not in train_df.columns and "Capacity_Score_0_100" in train_df.columns:
-        train_df = train_df.rename(columns={"Capacity_Score_0_100":"Capacity"})
-    m0 = pd.to_datetime(month, errors="coerce").to_period("M").to_timestamp()
+        train_df = train_df.rename(columns={"Capacity_Score_0_100": "Capacity"})
 
-    train_df, _dummy, _used = _resolve_and_standardize_numcases(train_df, df_in, pd.DataFrame(), m0,
-                                                                verbose=verbose, feature_scope=feature_scope)
+    m0 = _mstart(month)
 
-    # Fit models (direct / fixed / learn) — unchanged logic; omitted here for brevity:
-    base_feats = ("Capacity","numCases","StaffGroup"); learned_seq = None
+    # -------------------- 1) Fit outcome models (original behavior preserved) --------------------
+    learned_seq = None
     if use_causal_sequence == "learn":
-        if verbose: print("⚙️ Learning DAG order from data…")
-        if all(k in globals() for k in ["learn_sequence_from_data","fit_tree_models_dag"]):
-            try:
-                seq, _G = learn_sequence_from_data(train_df=train_df,
-                        candidate_targets=tuple([t for t in ["backlog","days_to_close","efficiency","WSI_0_100"] if t in train_df.columns]),
-                        base_features=base_feats, feature_scope=feature_scope, k=6, verbose=verbose)
-                models, mse_report = fit_tree_models_dag(train_df=train_df, seq=seq,
-                                                         base_features=base_feats, feature_scope=feature_scope)
-                learned_seq = seq
-            except Exception as e:
-                if verbose: print(f"⚠️ DAG learn failed ({e}); falling back to fixed causal order.")
-                use_causal_sequence = True
-        else:
-            if verbose: print("⚠️ DAG helpers not found; falling back to fixed causal order.")
+        try:
+            models, mse_report, learned_seq = _ensure_models_dag_learn(train_df)
+        except Exception as e:
+            if verbose:
+                print(f"⚠️ DAG learn failed ({e}); falling back to fixed causal order.")
             use_causal_sequence = True
-    if use_causal_sequence is True:
-        if verbose: print("⚙️ Using fixed causal order: backlog → days_to_close → efficiency → WSI_0_100")
+
+    if use_causal_sequence is True and learned_seq is None:
+        # fixed order if available
         seq = [t for t in ["backlog","days_to_close","efficiency","WSI_0_100"] if t in train_df.columns]
-        if "fit_tree_models_dag" in globals():
-            models, mse_report = fit_tree_models_dag(train_df=train_df, seq=seq,
-                                                     base_features=base_feats, feature_scope=feature_scope)
+        try:
+            models, mse_report = _ensure_models_dag_fixed(train_df, seq=seq)
             learned_seq = seq
-        else:
-            if verbose: print("⚠️ DAG fitter not found; using direct models instead.")
+        except Exception as e:
+            if verbose:
+                print(f"⚠️ Fixed DAG fit failed ({e}); falling back to direct models.")
             use_causal_sequence = False
-    if use_causal_sequence is False:
-        if verbose: print("⚙️ Using DIRECT models: y ~ Capacity + numCases + StaffGroup")
-        models, mse_report = fit_tree_models_from_features(train_df=train_df,
-                                targets=tuple([t for t in targets if t in train_df.columns]),
-                                num_features=["Capacity","numCases"], cat_features=["StaffGroup"])
+
+    if use_causal_sequence is False and learned_seq is None:
+        models, mse_report = _ensure_models_direct(train_df)
 
     if verbose and isinstance(models, dict):
-        feat_rows = []
+        rows = []
         for t, obj in models.items():
-            if isinstance(obj, dict): feat_rows.append({"target": t, "features": ", ".join(obj["features"])})
-        if feat_rows:
+            if isinstance(obj, dict) and "features" in obj:
+                rows.append({"target": t, "features": ", ".join(obj["features"])})
+        if rows:
             print("\n[INFO] Final feature sets per target:")
-            print(pd.DataFrame(feat_rows).sort_values("target").to_string(index=False))
+            print(pd.DataFrame(rows).sort_values("target").to_string(index=False))
 
-    # ---------- PRE ----------
+    # -------------------- 2) PRE grid (observed medians) --------------------
     pre_month = train_df[train_df["_date_"] == m0].copy()
-    pre_cols = ["Capacity"] + (["numCases"] if "numCases" in pre_month.columns else []) + [t for t in targets if t in pre_month.columns]
+    pre_cols = ["Capacity", "numCases"] + [t for t in targets if t in pre_month.columns]
     grid_pre = pre_month.groupby("StaffGroup")[pre_cols].median().reset_index()
 
-    rows = []
+    # -------------------- 3) Sanity ranges (p10–p95) --------------------
+    sanity_rows = []
     for metric in [m for m in ["Capacity","numCases",*targets] if m in pre_month.columns]:
         s = pd.to_numeric(pre_month[metric], errors="coerce").dropna()
         if s.empty: continue
-        rows.append({"metric": metric, "p10": np.percentile(s,10), "median": np.percentile(s,50), "p95": np.percentile(s,95)})
-    sanity_df = pd.DataFrame(rows).set_index("metric").sort_index()
+        sanity_rows.append({"metric": metric,
+                            "p10": np.percentile(s,10),
+                            "median": np.percentile(s,50),
+                            "p95": np.percentile(s,95)})
+    sanity_df = pd.DataFrame(sanity_rows).set_index("metric").sort_index()
 
-    # ---------- POST simulate ----------
-    post_cap = simulate_post_capacity(df_in, scores_baseline, month, moves).copy()
+    # -------------------- 4) POST alias simulation (simulate_post_capacity) --------------------
+    # Auto-train numcases model if requested
+    if recompute_capacity_post and capacity_method == "numcases_model" and numcases_model is None:
+        numcases_model = _fit_capacity_from_numcases_model(
+            df_full=df_in,
+            scores=scores_baseline,
+            wsi_kwargs=wsi_kwargs,               # <-- pass wsi_kwargs so we can infer col names
+            numcases_col=numcases_col_for_model  # <-- typically "numCases"
+        )
+
+    # simulate_post_capacity must exist in your module. We call it with new kwargs; defaults keep old behavior
+    post_cap = simulate_post_capacity(
+        df_in=df_in,
+        scores_baseline=scores_baseline,
+        month=month,
+        moves=moves,
+        # NEW sequence control:
+        recompute_capacity_post=recompute_capacity_post,
+        capacity_method=capacity_method,          # "scorer" | "knn" | "numcases_model"
+        prep=prep, scorer=scorer,                 # used if capacity_method="scorer"
+        capacity_features=capacity_features,      # optional
+        numcases_model=numcases_model,            # used if capacity_method="numcases_model"
+        numcases_col_for_model=numcases_col_for_model,
+        # Keep original redistributor behavior
+        rebalance_workload=True, workload_cols=["numCases"],
+        rebalance_method="proportional",
+        # Keep original KNN off by default; you can toggle in simulate_post_capacity
+        use_knn=False,
+        verbose=verbose
+    )
     if not isinstance(post_cap, pd.DataFrame):
         raise TypeError("simulate_post_capacity must return a pandas DataFrame")
-    if "_date_" in post_cap.columns:
-        post_cap["_date_"] = pd.to_datetime(post_cap["_date_"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-        post_cap = post_cap.loc[post_cap["_date_"] == m0].copy()
-    if "Capacity" not in post_cap.columns and "Capacity_Score_0_100" in post_cap.columns:
-        post_cap = post_cap.rename(columns={"Capacity_Score_0_100":"Capacity"})
-    if "StaffGroup" in post_cap.columns:
-        post_cap["StaffGroup"] = post_cap["StaffGroup"].astype("string").fillna("__MISSING__")
 
-    # ensure numCases present (FIX: return post_cap!)
-    post_cap = _ensure_numcases_post(pre_month=pre_month, post_cap=post_cap, df_in=df_in, m0=m0,
-                                     feature_scope=feature_scope, verbose=verbose)
-
-    # ---------- POST predict ----------
+    # -------------------- 5) POST predictions (original behavior preserved) --------------------
     alias_missing = "alias" not in post_cap.columns
     effective_team_level = team_level_post or alias_missing
-    if alias_missing and verbose: print("ℹ️ 'alias' not found in post_cap — switching to team-level POST prediction.")
 
     if not effective_team_level:
         if show_predict_samples:
-            cols = [c for c in ["Capacity","numCases","StaffGroup"] if c in post_cap.columns]
+            cols_preview = [c for c in ["Capacity","numCases","StaffGroup"] if c in post_cap.columns]
             print("\n[DEBUG] Alias-level POST input (first 12 rows):")
-            print(post_cap[cols].head(12).to_string(index=False)); print("Rows to predict (alias-level):", len(post_cap))
-        if use_causal_sequence in (True,"learn") and "predict_post_from_dag" in globals():
-            grid_post = predict_post_from_dag(post_df=post_cap, models=models, seq=learned_seq,
-                                              team_aggregate="median", debug_sample=show_predict_samples)
+            print(post_cap[cols_preview].head(12).to_string(index=False))
+            print("Rows to predict (alias-level):", len(post_cap))
+
+        if use_causal_sequence in (True, "learn") and "predict_post_from_dag" in globals():
+            grid_post = predict_post_from_dag(
+                post_df=post_cap,
+                models=models,
+                seq=learned_seq,
+                team_aggregate="median",
+                debug_sample=show_predict_samples
+            )
         else:
-            grid_post = predict_post_from_cap_and_cases(post_df=post_cap, models=models, targets=targets,
-                                                        team_aggregate="median", debug_sample=False)
+            # direct path
+            grid_post = predict_post_from_cap_and_cases(
+                post_df=post_cap,
+                models=models,
+                targets=targets,
+                team_aggregate="median",
+                debug_sample=False
+            )
+
     else:
+        # Team-level path: aggregate inputs first, then predict once per team
         agg_cols = [c for c in ["Capacity","numCases"] if c in post_cap.columns]
         team_post = post_cap.groupby("StaffGroup", as_index=False)[agg_cols].median()
-        X_team = team_post.copy(); X_team["StaffGroup"] = X_team["StaffGroup"].astype("string").fillna("__MISSING__")
+        X_team = team_post.copy()
+        X_team["StaffGroup"] = X_team["StaffGroup"].astype("string").fillna("__MISSING__")
+
         if show_predict_samples:
             print("\n[DEBUG] Team-level POST input (first 12 rows):")
-            print(X_team.head(12).to_string(index=False)); print("Rows to predict (team-level):", len(X_team))
-        if use_causal_sequence in (True,"learn") and "predict_post_from_dag" in globals():
-            grid_post = predict_post_from_dag(post_df=X_team, models=models, seq=learned_seq,
-                                              team_aggregate="median", debug_sample=show_predict_samples)
+            print(X_team.head(12).to_string(index=False))
+            print("Rows to predict (team-level):", len(X_team))
+
+        if use_causal_sequence in (True, "learn") and "predict_post_from_dag" in globals():
+            grid_post = predict_post_from_dag(
+                post_df=X_team,
+                models=models,
+                seq=learned_seq,
+                team_aggregate="median",
+                debug_sample=show_predict_samples
+            )
             grid_post = grid_post.merge(team_post, on="StaffGroup", how="left")
         else:
             preds = {"StaffGroup": X_team["StaffGroup"].to_numpy()}
             for t in targets:
                 mdl = models[t]["pipe"] if isinstance(models.get(t), dict) else models[t]
-                cols = [c for c in ["Capacity","numCases","StaffGroup"] if c in X_team.columns]
-                preds[t] = mdl.predict(X_team[cols])
+                cols_use = [c for c in ["Capacity","numCases","StaffGroup"] if c in X_team.columns]
+                preds[t] = mdl.predict(X_team[cols_use])
             grid_post = pd.DataFrame(preds).merge(team_post, on="StaffGroup", how="left")
 
-    # Ensure Capacity/numCases in POST grid (don’t overwrite non-null)
+    # ---- Ensure Capacity & numCases exist in POST grid (for combined view) ----
     try:
-        cap_team = post_cap.groupby("StaffGroup", as_index=False)[["Capacity"]].median().rename(columns={"Capacity":"Capacity_team_median_post"})
+        cap_team = (post_cap.groupby("StaffGroup", as_index=False)[["Capacity"]]
+                    .median().rename(columns={"Capacity":"Capacity_team_median_post"}))
         grid_post = grid_post.merge(cap_team, on="StaffGroup", how="left")
         if "Capacity" in grid_post.columns:
             grid_post["Capacity"] = grid_post["Capacity"].combine_first(grid_post["Capacity_team_median_post"])
@@ -1916,7 +1910,8 @@ def pre_post_tree_pipeline_cap_cases(
 
     if "numCases" not in grid_post.columns:
         try:
-            nc_team = post_cap.groupby("StaffGroup", as_index=False)[["numCases"]].median().rename(columns={"numCases":"numCases_team_median_post"})
+            nc_team = (post_cap.groupby("StaffGroup", as_index=False)[["numCases"]]
+                       .median().rename(columns={"numCases":"numCases_team_median_post"}))
             grid_post = grid_post.merge(nc_team, on="StaffGroup", how="left")
             grid_post["numCases"] = grid_post["numCases_team_median_post"]
             grid_post.drop(columns=["numCases_team_median_post"], inplace=True)
@@ -1924,28 +1919,30 @@ def pre_post_tree_pipeline_cap_cases(
             if "team_post" in locals() and "numCases" in team_post.columns:
                 grid_post = grid_post.merge(team_post[["StaffGroup","numCases"]], on="StaffGroup", how="left")
 
-    # ---------- combine & plot ----------
+    # -------------------- 6) Impacted filter (unchanged) --------------------
     if only_impacted:
-        impacted = get_impacted_sgs(moves)
-        if not grid_pre.empty:  grid_pre  = grid_pre[grid_pre["StaffGroup"].isin(impacted)]
-        if not grid_post.empty: grid_post = grid_post[grid_post["StaffGroup"].isin(impacted)]
+        if "get_impacted_sgs" in globals():
+            impacted = get_impacted_sgs(moves)
+        else:
+            impacted = list({mv.get("from") for mv in moves} | {mv.get("to") for mv in moves})
+        if not grid_pre.empty:
+            grid_pre = grid_pre[grid_pre["StaffGroup"].isin(impacted)]
+        if not grid_post.empty:
+            grid_post = grid_post[grid_post["StaffGroup"].isin(impacted)]
 
+    # -------------------- 7) Combine + sanity-plot (unchanged) --------------------
     if verbose:
         print("\n[DEBUG] grid_pre columns:", list(grid_pre.columns), "shape:", grid_pre.shape)
         print("[DEBUG] grid_post columns:", list(grid_post.columns), "shape:", grid_post.shape)
 
     gp = grid_pre.copy(); gp["Scenario"] = "Pre"
     gq = grid_post.copy(); gq["Scenario"] = "Post (pred)"
-    combined = pd.concat([gp, gq], ignore_index=True).sort_values(["StaffGroup","Scenario"]).reset_index(drop=True)
+    combined = (pd.concat([gp, gq], ignore_index=True)
+                .sort_values(["StaffGroup","Scenario"])
+                .reset_index(drop=True))
 
-    fig = plot_color_grid_with_sanity_range(
-        combined_table=combined,
-        sanity_df=sanity_df,
-        metrics=[m for m in ["Capacity","numCases","WSI_0_100","efficiency","days_to_close","backlog"] if m in combined.columns],
-        low_col="p10", high_col="p95",
-        soft_color="rgba(255, 99, 71, 0.18)", base_color="rgba(0,0,0,0)",
-        title="Pre vs. Post (sanity-flagged cells: outside p10–p95)"
-    )
+    title = "Pre vs Post (sanity-flagged cells: outside p10–p95)"
+    fig = _plot_sanity_table(combined, sanity_df, title=title)
 
     return grid_pre, grid_post, combined, fig, mse_report, sanity_df
 
@@ -2630,7 +2627,9 @@ def run_simulation_bootstrap(
     use_causal_sequence: object = "learn",
     feature_scope: list[str] | None = None,
     metrics_for_ci: list[str] = None,       # restrict which metrics you want CI for
-    base_seed: int = 12345
+    base_seed: int = 12345,
+    **pipeline_kwargs   # <---- NEW (forwards all new args)
+
 ):
     """
     Run your existing pre_post_tree_pipeline_cap_cases multiple times over bootstrap resamples
@@ -2658,7 +2657,9 @@ def run_simulation_bootstrap(
         team_level_post=team_level_post,
         show_predict_samples=show_predict_samples,
         use_causal_sequence=use_causal_sequence,
-        feature_scope=feature_scope
+        feature_scope=feature_scope,
+        **pipeline_kwargs        # <--- ADD THIS
+
     )
 
     # 2) Bootstrap loop
@@ -2690,7 +2691,9 @@ def run_simulation_bootstrap(
                 team_level_post=team_level_post,
                 show_predict_samples=False,             # keep quiet in boot runs
                 use_causal_sequence=use_causal_sequence,
-                feature_scope=feature_scope
+                feature_scope=feature_scope,
+                **pipeline_kwargs        # <--- ADD THIS
+
             )
             # Keep only needed columns to save memory
             keep_cols = ["StaffGroup","Scenario"] + [c for c in metrics_for_ci if c in combined_b.columns]
@@ -2786,7 +2789,17 @@ def build_contributions_df(
     """
 
     # Normalize month key
-    def _mstart(s): return pd.to_datetime(s, errors="coerce").dt.to_period("M").dt.to_timestamp()
+    def _mstart(s):
+        """
+        Normalize datetime-like Series/array/scalar to month-start Timestamp(s).
+        Works for pandas Series/Index/list-likes and scalars.
+        """
+        x = pd.to_datetime(s, errors="coerce")
+        # Series / Index / list-like → has .dt
+        if hasattr(x, "dt"):
+            return x.dt.to_period("M").dt.to_timestamp()
+        # scalar datetime
+        return pd.to_datetime(x).to_period("M").to_timestamp()
 
     # Base id table (one row per alias×month)
     base_ids = (df_full[[cols.alias, cols.date, cols.group]]
@@ -2925,7 +2938,16 @@ def build_wsi_contributions_df(
     """
 
     def _mstart(s):
-        return pd.to_datetime(s, errors="coerce").dt.to_period("M").dt.to_timestamp()
+        """
+        Normalize datetime-like Series/array/scalar to month-start Timestamp(s).
+        Works for pandas Series/Index/list-likes and scalars.
+        """
+        x = pd.to_datetime(s, errors="coerce")
+        # Series / Index / list-like → has .dt
+        if hasattr(x, "dt"):
+            return x.dt.to_period("M").dt.to_timestamp()
+        # scalar datetime
+        return pd.to_datetime(x).to_period("M").to_timestamp()
 
     # Normalize month
     am = alias_metrics.copy()
@@ -3055,3 +3077,71 @@ def build_wsi_contributions_df(
     out = long[order + extra].sort_values([cols.alias, cols.date, "component"]).reset_index(drop=True)
     return out
 
+
+# ========= helper: train capacity-from-numCases model =========
+from typing import Optional, List, Dict, Tuple
+import numpy as np
+import pandas as pd
+
+def fit_capacity_from_numcases_model(
+    df_full: pd.DataFrame,
+    scores: pd.DataFrame,
+    *,
+    cols,                                  # ColumnMap (with .date, .alias, .group)
+    numcases_col: str = "numCases",
+    random_state: int = 42
+):
+    """
+    Train a simple, robust model: Capacity_Score_0_100 ~ f(numCases, StaffGroup)
+    using ALL months in df_full.
+
+    Returns: sklearn Pipeline (ColumnTransformer[OneHotEncoder] + Regressor)
+    """
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.pipeline import Pipeline
+
+    # Regressor: prefer XGB, else RandomForest
+    try:
+        from xgboost import XGBRegressor
+        Regr = XGBRegressor(
+            n_estimators=500, max_depth=6, learning_rate=0.06,
+            subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
+            objective="reg:squarederror", n_jobs=-1, random_state=random_state
+        )
+    except Exception:
+        from sklearn.ensemble import RandomForestRegressor
+        Regr = RandomForestRegressor(n_estimators=600, random_state=random_state, n_jobs=-1)
+
+    # Join all months, normalize date to month-start
+    df = df_full[[cols.alias, cols.date, cols.group, numcases_col]].copy()
+    df[cols.date] = pd.to_datetime(df[cols.date], errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+    y = scores[[cols.alias, cols.date, "Capacity_Score_0_100"]].copy()
+    y[cols.date] = pd.to_datetime(y[cols.date], errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+    data = df.merge(y, on=[cols.alias, cols.date], how="inner").dropna(subset=[numcases_col, "Capacity_Score_0_100"])
+    if data.empty:
+        raise ValueError("No rows to train capacity-from-numCases model; check inputs.")
+
+    # Features: numCases + StaffGroup
+    num_features = [numcases_col]
+    cat_features = [cols.group]
+
+    X_num = data[num_features].copy()
+    X_cat = data[cat_features].copy().astype("string").fillna("__MISSING__")
+    X = pd.concat([X_num, X_cat], axis=1)
+    y = pd.to_numeric(data["Capacity_Score_0_100"], errors="coerce")
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", num_features),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_features),
+        ],
+        remainder="drop",
+    )
+
+    pipe = Pipeline([("prep", pre), ("regr", Regr)])
+    pipe.fit(X, y)
+
+    return pipe
